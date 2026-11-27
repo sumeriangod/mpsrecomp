@@ -522,8 +522,10 @@ def main():
                 continue
             # (the same with moves for the cases' arguments scheduled between, eight or more instructions apart:
             # `adr xR, base ; ldrb wI, [table] ; add xR, xR, xI, lsl #2 ; mov ... ; br xR`; ported from sm35recomp
-            # 51fadb4, where a relay message handler's 25 cases were cut off this way)
-            win = range(i + 1, min(i + 17, len(m.words)))
+            # 51fadb4, where a relay message handler's 25 cases were cut off this way). Up to 32: MPS has four tables
+            # whose br comes 17 to 21 instructions after (hs::ModelBlink::StartBlinkType: fifteen float constants
+            # between), each cut off at 16 - its cases unreachable, "no function at" mid-game
+            win = range(i + 1, min(i + 33, len(m.words)))
             if any((m.words[j] & 0xFFE0FC00) == 0x8B000800 and (m.words[j] >> 5) & 31 == rd and m.words[j] & 31 == rd
                    for j in win) and any(m.words[j] & 0xFFFFFC1F == 0xD61F0000 and (m.words[j] >> 5) & 31 == rd
                                           for j in win):
