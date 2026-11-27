@@ -4,14 +4,12 @@
 // file the game reads or a game's hint first. Each is translated to GLSL as the first use will translate it and
 // compiled to SPIR-V into cache/spirv/ (shaders.c), where the first use then finds it: unlike Metal's shader cache, that
 // one is ours and stays. Left for the first use: the pipelines (the driver's compile; VkPipelineCache), programs with
-// another key. The scan reads and queues on one low-priority thread; two low-priority compilers (MPS's .bea archives
-// hold some 130,000 shaders) translate and compile, each waiting while the game is building (build_idle_ms()).
+// another key. One low-priority thread; it waits while the game is building (build_idle_ms()).
 // LARECOMP_AHEAD=0: off; =force: ignore the stamp (cache/ahead_vk.done). LARECOMP_AHEAD_QUIET_MS (1500).
 #include <SDL3/SDL_thread.h>
 #include <SDL3/SDL_timer.h>
 #include <pthread.h>
 #include <stdatomic.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -26,68 +24,9 @@ static struct {
     atomic_int started;
     volatile int stop;
     ShaderKey vkey, fkey;
-    atomic_int items, set_progs, compiled, cached, failed, untranslatable;
+    int items, set_progs, compiled, cached, failed, untranslatable;
     double t0, last_log;
 } vah;
-
-// ---- the scan's shaders, queued for the compilers (copies: the scan's buffers and names are gone after its callback)
-typedef struct Job { struct Job *next; AheadShader sh; char name[160]; uint8_t bytes[]; } Job;
-#define Q_MAX 256
-static pthread_mutex_t q_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t q_more = PTHREAD_COND_INITIALIZER, q_room = PTHREAD_COND_INITIALIZER;
-static Job *q_head, *q_tail;
-static int q_len, q_busy;
-static volatile int q_scanning;
-
-static void job_add(const AheadShader *s) {
-    size_t total = 0;
-    for (int k = 0; k < 3; k++) if (s->code[k]) total += s->cmax[k];
-    Job *j = malloc(sizeof *j + total);
-    if (!j) return;
-    j->next = NULL, j->sh = *s;
-    snprintf(j->name, sizeof j->name, "%s", s->archive ? s->archive : "");
-    j->sh.archive = j->name;
-    uint8_t *b = j->bytes;
-    for (int k = 0; k < 3; k++)
-        if (s->code[k]) memcpy(b, s->code[k], s->cmax[k]), j->sh.code[k] = b, b += s->cmax[k];
-    pthread_mutex_lock(&q_lock);
-    while (q_len >= Q_MAX && !vah.stop) pthread_cond_wait(&q_room, &q_lock);
-    if (q_tail) q_tail->next = j; else q_head = j;
-    q_tail = j, q_len++;
-    pthread_cond_signal(&q_more);
-    pthread_mutex_unlock(&q_lock);
-}
-static Job *job_take(int wait_ms) {
-    pthread_mutex_lock(&q_lock);
-    if (!q_head && wait_ms > 0 && !vah.stop) {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += (long)wait_ms * 1000000L;
-        while (ts.tv_nsec >= 1000000000L) ts.tv_sec++, ts.tv_nsec -= 1000000000L;
-        pthread_cond_timedwait(&q_more, &q_lock, &ts);
-    }
-    Job *j = q_head;
-    if (j) {
-        q_head = j->next;
-        if (!q_head) q_tail = NULL;
-        q_len--, q_busy++;
-        pthread_cond_signal(&q_room);
-    }
-    pthread_mutex_unlock(&q_lock);
-    return j;
-}
-static void job_done(Job *j) {
-    free(j);
-    pthread_mutex_lock(&q_lock);
-    q_busy--;
-    pthread_mutex_unlock(&q_lock);
-}
-static int jobs_left(void) {
-    pthread_mutex_lock(&q_lock);
-    int n = q_len + q_busy;
-    pthread_mutex_unlock(&q_lock);
-    return n;
-}
 
 static double now_ms(void) {
     struct timespec ts;
@@ -147,38 +86,19 @@ static void take_set(int wait_ms, double max_age_ms, int most) {
     }
 }
 
-// A compiler: the programs the game has just set first (what it draws soonest), then the scan's queue with the boot
-// backlog one at a time between (the order: renderer.m's ahead_scanned); once the scan is done, the programs the game
-// sets, for as long as it runs
-static void *compiler(void *arg) {
-    (void)arg;
-    SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_LOW);
-    maxwell_gmem_base = HEAP_BASE;  // (as the game's translations: the bounds appear in the sources)
-    maxwell_gmem_size = HEAP_MAX;
-    while (!vah.stop) {
-        take_set(0, 10000, 1 << 30);
-        Job *j = job_take(q_scanning ? 100 : 0);
-        if (j) {
-            item(&j->sh);
-            job_done(j);
-            take_set(0, -1, 1);
-            continue;
-        }
-        take_set(q_scanning ? 0 : 1000, -1, 1 << 30);
-    }
-    return NULL;
-}
-
+// (the order: renderer.m's ahead_scanned)
 static bool scanned(const AheadShader *s, void *ud) {
     (void)ud;
+    take_set(0, 10000, 1 << 30);
+    take_set(0, -1, s->rank >= 1 ? 1 << 30 : 1);
     if (vah.stop) return false;
     vah.items++;
     shader_ahead_status_set(1, vah.items, vah.compiled);  // (the menu's progress: Video > Shaders)
-    job_add(s);
+    item(s);
     if (now_ms() - vah.last_log > 30000) {
         vah.last_log = now_ms();
         LOG("[shader] compile-ahead: %d shaders read, %d programs the game set, %d compiled to SPIR-V, %.0f s in; now %s\n",
-            (int)vah.items, (int)vah.set_progs, (int)vah.compiled, (vah.last_log - vah.t0) / 1000, s->archive);
+            vah.items, vah.set_progs, vah.compiled, (vah.last_log - vah.t0) / 1000, s->archive);
     }
     return !vah.stop;
 }
@@ -191,28 +111,22 @@ static void stamp(char *out, size_t cap) {
              vah.vkey.depth_minus_one, maxwell_glsl_bda, maxwell_glsl_gmap_gfx);  // (the GLSL differs with the gmem mode)
 }
 
-static void stop_ahead(void) {
-    vah.stop = 1;
-    pthread_mutex_lock(&q_lock);
-    pthread_cond_broadcast(&q_room);
-    pthread_cond_broadcast(&q_more);
-    pthread_mutex_unlock(&q_lock);
-}
+static void stop_ahead(void) { vah.stop = 1; }
 
-static void *worker(void *arg) {  // (the scan)
-    (void)arg;
+static void *worker(void *arg) {
+    bool scan = arg != NULL;
     SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_LOW);
     vah.t0 = vah.last_log = now_ms();
-    shader_ahead_status_set(1, 0, 0);
-    {
+    maxwell_gmem_base = HEAP_BASE;  // (as the game's translations: the bounds appear in the sources)
+    maxwell_gmem_size = HEAP_MAX;
+    shader_ahead_status_set(scan ? 1 : 2, 0, 0);
+    if (scan) {
         AheadScanStats st;
         bool full = shader_ahead_scan(g_romfs_dir, scanned, NULL, &vah.stop, &st);
-        while (!vah.stop && jobs_left()) SDL_Delay(100);  // (what it queued compiled before it counts as done)
-        q_scanning = 0;
         LOG("[shader] compile-ahead %s: %d shaders + %d programs from %d files (%d read early for the game), %d programs the "
             "game set; %d compiled to SPIR-V, %d cached already, %d failed, %d not translatable; %.1f s\n",
-            full ? "finished" : "stopped", st.shaders, st.programs, st.files, st.preferred, (int)vah.set_progs,
-            (int)vah.compiled, (int)vah.cached, (int)vah.failed, (int)vah.untranslatable, (now_ms() - vah.t0) / 1000);
+            full ? "finished" : "stopped", st.shaders, st.programs, st.files, st.preferred, vah.set_progs, vah.compiled, vah.cached,
+            vah.failed, vah.untranslatable, (now_ms() - vah.t0) / 1000);
         if (full && !vah.stop) {
             char s[256];
             stamp(s, sizeof s);
@@ -222,6 +136,7 @@ static void *worker(void *arg) {  // (the scan)
         }
         shader_ahead_status_set(full ? 2 : 0, st.shaders + st.programs, vah.compiled);
     }
+    while (!vah.stop) take_set(1000, -1, 1 << 30);  // (then the programs the game sets, for as long as it runs)
     return NULL;
 }
 
@@ -240,16 +155,7 @@ void vk_ahead_start(const ShaderKey *vkey, const ShaderKey *fkey) {
     if (fp) { size_t n = fread(old, 1, sizeof old - 1, fp); old[n] = 0; fclose(fp); }
     bool scan = strcmp(now, old) != 0 || (mode && !strcmp(mode, "force"));
     if (!scan) LOG("[shader] compile-ahead: the game's files were done before (cache/ahead_vk.done); programs the game sets still are\n");
-    if (!scan) shader_ahead_status_set(2, 0, 0);
     atexit(stop_ahead);
     pthread_t t;
-    q_scanning = scan;
-    // (two: eight took the board's frame rate from 50 to 46 fps and doubled its stutter on a 13700K, the first session
-    // worse for content not yet seen. LARECOMP_AHEAD_THREADS=<n> for tests)
-    const char *te = getenv("LARECOMP_AHEAD_THREADS");
-    int n = te && atoi(te) > 0 ? atoi(te) : 2;
-    n = n > 16 ? 16 : n;
-    for (int i = 0; i < n; i++)
-        if (pthread_create(&t, NULL, compiler, NULL) == 0) pthread_detach(t);
-    if (scan && pthread_create(&t, NULL, worker, NULL) == 0) pthread_detach(t);
+    if (pthread_create(&t, NULL, worker, scan ? (void *)1 : NULL) == 0) pthread_detach(t);
 }

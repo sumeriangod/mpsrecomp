@@ -222,31 +222,6 @@ static void scan_sarc(Scan *s, const uint8_t *d, size_t n, const char *name, int
     }
 }
 
-// A BEA archive (Mario Party Superstars' .nx.bea): "SCNE", the entry count @+0x20, an array of ASST offsets @+0x28 (u64
-// each). An ASST: its stored size @+0x14, data @+0x20 (zstd, or as is), its name @+0x28 (u16 length, then the chars).
-// Textures are skipped before they're unpacked: in MPS they're half of the 5.6 GB, and never hold shaders.
-static void scan_bea(Scan *s, const uint8_t *d, size_t n, const char *name, int depth) {
-    if (n < 0x30) return;
-    uint64_t cnt = le64(d + 0x20), arr = le64(d + 0x28);
-    if (arr > n || cnt > (n - arr) / 8) return;
-    s->st->archives++;
-    for (uint64_t i = 0; i < cnt && !s->halted; i++) {
-        if (s->stop && *s->stop) { s->halted = true; break; }
-        scan_preferred(s);
-        uint64_t a = le64(d + arr + i * 8);
-        if (a > n - 0x30 || memcmp(d + a, "ASST", 4)) continue;
-        uint64_t stored = le32(d + a + 0x14), off = le64(d + a + 0x20), no = le64(d + a + 0x28);
-        if (off > n || stored > n - off) continue;
-        int mlen = no < n - 2 ? le16(d + no) : 0;
-        if (mlen > (int)(n - no - 2)) mlen = 0;
-        const char *mname = (const char *)d + no + 2;
-        if (mlen > 5 && !memcmp(mname + mlen - 5, ".bntx", 5)) continue;
-        char member[512];
-        snprintf(member, sizeof member, "%s:%.*s", name, mlen, mlen ? mname : "?");
-        scan_blob(s, d + off, (size_t)stored, member, depth + 1);
-    }
-}
-
 static void scan_blob(Scan *s, const uint8_t *d, size_t n, const char *name, int depth) {
     if (n < 16 || depth > MAX_DEPTH || s->halted) return;
     uint8_t *own = NULL;
@@ -255,7 +230,6 @@ static void scan_blob(Scan *s, const uint8_t *d, size_t n, const char *name, int
     else if (le32(d) == 0xFD2FB528u) own = unzstd(d, n, &on);
     if (own) d = own, n = on;
     if (!memcmp(d, "SARC", 4)) scan_sarc(s, d, n, name, depth);
-    else if (!memcmp(d, "SCNE", 4)) scan_bea(s, d, n, name, depth);
     else {
         // whole programs from the BNSH archives (aligned blocks in shader archives): a model's fragment shaders as its
         // programs pair them (an input its vertex shader doesn't write reads a constant)
@@ -316,7 +290,7 @@ static void scan_file(Scan *s, const char *root, const char *rel) {
     if (fstat(fd, &sb) != 0 || sb.st_size < 0x100 || pread(fd, head, sizeof head, 0) != (ssize_t)sizeof head) { close(fd); return; }
     // (archives and files that may hold shaders; audio, textures and the rest aren't read)
     bool want = !memcmp(head, "SARC", 4) || !memcmp(head, "Yaz0", 4) || le32(head) == 0xFD2FB528u || !memcmp(head, "BNSH", 4) ||
-                !memcmp(head, "BAHS", 4) || !memcmp(head, "VFXB", 4) || !memcmp(head, "FSHA", 4) || !memcmp(head, "SCNE", 4);
+                !memcmp(head, "BAHS", 4) || !memcmp(head, "VFXB", 4) || !memcmp(head, "FSHA", 4);
     if (!want) { close(fd); return; }
     size_t n = (size_t)sb.st_size;
 #ifndef _WIN32
@@ -382,10 +356,7 @@ static void scan_preferred(Scan *s) {
         for (int k = 0; k < s->files->n && !s->halted; k++) {
             FileEnt *f = &s->files->v[k];
             if (!f->rel || !(hint ? glob_match(want, f->rel) : !strcmp(f->rel, want))) continue;
-            // (a big archive read at load isn't drawn from at once - but a .bea is one board, minigame or character, all
-            // of it drawn next: Mario Party Superstars reads nothing else)
-            size_t rl = strlen(f->rel);
-            if (!hint && f->size > PREFER_MAX_SIZE && !(rl > 4 && !strcmp(f->rel + rl - 4, ".bea"))) break;
+            if (!hint && f->size > PREFER_MAX_SIZE) break;  // (a big archive read at load isn't drawn from at once)
             int rank = s->rank;
             s->rank = -1;
             scan_file(s, s->root, f->rel);
