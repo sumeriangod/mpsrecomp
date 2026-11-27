@@ -25,6 +25,7 @@ stage_common() {
     # the compiler
     [ -d "build/zig-$zt" ] || ZIG_TARGET=$zt ZIG_OUT="build/zig-$zt" tools/fetch_zig.sh
     cp -R "build/zig-$zt" "$dest/zig"
+    cp games/mps/recomplauncher.json "$dest/"  # (Recomp Launcher's manifest: at the top, next to the program)
     # licenses
     cp LICENSE "$dest/licenses/LICENSE-GPL-3.0.txt"
     cp LICENSE-LASRecomp "$dest/licenses/LICENSE-LASRecomp.txt"

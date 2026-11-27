@@ -163,7 +163,11 @@ static void log_to_file_without_console(void) {
         fprintf(stderr, "[platform] the program's folder can't be written: this log is %s\n", g_log_path);
     }
     setvbuf(stderr, NULL, _IONBF, 0);
-    _dup2(_fileno(stderr), _fileno(stdout));
+    // stdout into the log too, unless the program that started this one reads it (a launcher following --prepare's
+    // progress lines: runtime/prepare.c)
+    HANDLE so = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD so_type = so && so != INVALID_HANDLE_VALUE ? GetFileType(so) : FILE_TYPE_UNKNOWN;
+    if (so_type != FILE_TYPE_PIPE && so_type != FILE_TYPE_DISK) _dup2(_fileno(stderr), _fileno(stdout));
     _putenv("LASRECOMP_LOG_APPEND=1");
 }
 

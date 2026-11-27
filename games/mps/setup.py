@@ -139,13 +139,18 @@ def copy_exefs(src, dst, check_hashes=True):
 
 
 # ------------------------------------------------------------------ RomFS
+SYMLINKS = True  # (--no-symlinks: hard links or copies only, so the game runs without the chosen folder)
+
+
 def place(target, link):
-    """A symlink; where the OS won't make one (Windows without Developer Mode), a hard link (same drive), else a copy."""
-    try:
-        os.symlink(target, link)
-        return
-    except OSError:
-        pass
+    """A symlink; where the OS won't make one (Windows without Developer Mode) or with --no-symlinks, a hard link (same
+    drive), else a copy."""
+    if SYMLINKS:
+        try:
+            os.symlink(target, link)
+            return
+        except OSError:
+            pass
     try:
         os.link(target, link)
     except OSError:
@@ -165,13 +170,15 @@ def link_tree(src, dst, counts):
             target = os.path.realpath(os.path.join(root, f))
             link = os.path.join(out, f)
             if os.path.islink(link):
-                if os.readlink(link) == target:
+                if SYMLINKS and os.readlink(link) == target:
                     counts['same'] += 1
                     continue
                 os.remove(link)
                 counts['replaced'] += 1
             elif os.path.exists(link):  # (a hard link or copy from place(): replaced the same way)
-                if os.path.samefile(link, target):
+                a, b = os.stat(link), os.stat(target)
+                if os.path.samefile(link, target) or (a.st_size, int(a.st_mtime)) == (b.st_size, int(b.st_mtime)):
+                    # (a copy2 copy keeps size and time: the same file, not copied again)
                     counts['same'] += 1
                     continue
                 os.remove(link)
@@ -568,8 +575,7 @@ def setup_from_sources(sources, out, keys, hactool, check_hashes=True):
             raise SetupError('WRONG_VERSION', f'These game files are version {", ".join(vers)}',
                              f'The recomp needs version {V}: {GET_VERSION}.')
         raise SetupError('NO_EXEFS', 'No game code (ExeFS) found in the chosen files',
-                         f'Choose the game\'s NSP / XCI{f" with its {V} update NSP" if NEEDS_UPDATE else ""}, or the '
-                         f'folders of the extracted ExeFS ({", ".join(EXEFS_FILES)}) and RomFS.')
+                         f'Choose the folder with the game\'s extracted ExeFS ({", ".join(EXEFS_FILES)}) and RomFS.')
     say('step', 'Checking the game version')
     say('progress', '0.62')
     ex = good[0]
@@ -620,8 +626,11 @@ def main():
     ap.add_argument('--keys')
     ap.add_argument('--hactool')
     ap.add_argument('--no-hash-check', action='store_true')  # (development: a modified ExeFS)
+    ap.add_argument('--no-symlinks', action='store_true')  # (runtime/prepare.c: the game runs without the source)
     ap.add_argument('--out', required=True)
     a = ap.parse_args()
+    global SYMLINKS
+    SYMLINKS = not a.no_symlinks
     if a.source:
         try:
             setup_from_sources(a.source, a.out, a.keys, a.hactool, not a.no_hash_check)

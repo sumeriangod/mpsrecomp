@@ -300,6 +300,17 @@ int main(int argc, char **argv) {
 #else
     setvbuf(stderr, NULL, _IOLBF, 0);
 #endif
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--prepare")) {  // --prepare <game folder>: a launcher's setup step (runtime/prepare.c)
+            static char game[1024];
+            if (i + 1 >= argc || !realpath(argv[i + 1], game)) {  // (before rt_paths_init changes the directory)
+                printf("usage: %s --prepare <folder with the game's extracted exefs and romfs>\n", argv[0]);
+                return 1;
+            }
+            rt_paths_init();
+            extern int prepare_cli(const char *game);
+            return prepare_cli(game);
+        }
     const char *root = "extracted";  // (in the data root)
     static char arg_root[1024];
     bool setup = false;  // --setup: the setup screen even when everything is there
